@@ -178,17 +178,25 @@ public class NewFoodUtils {
 
     public static boolean hasBestOptionInInv(final InventoryCitizen inventoryCitizen, final ICitizenData citizenData, @Nullable final Set<ItemStorage> menu, final IBuilding building)
     {
-        final int invSlot = getBestFoodForCitizenWithRestaurantCheck(inventoryCitizen, citizenData ,menu ,true);
-        // Smaller score is better.
-        float bestScore = Integer.MAX_VALUE;
-        float bestInvScore = Integer.MAX_VALUE;
-        if (invSlot >= 0)
+        final int invSlot = getBestFoodForCitizenWithRestaurantCheck(inventoryCitizen, citizenData, menu, false);
+        if (invSlot < 0)
         {
-            final ItemStack stack = inventoryCitizen.getStackInSlot(invSlot);
-            bestInvScore = getRecalLocalScore(citizenData, stack.getItem());
-            if(bestInvScore == Float.MIN_VALUE){
-                return true;
-            }
+            return false;
+        }
+
+        // Smaller score is better.
+        float bestScore = Float.MAX_VALUE;
+        final ItemStack stack = inventoryCitizen.getStackInSlot(invSlot);
+        final float bestInvScore = getRecalLocalScore(citizenData, stack.getItem());
+        if (bestInvScore == Float.MIN_VALUE)
+        {
+            return true;
+        }
+
+        IBuilding workBuilding = citizenData.getWorkBuilding();
+        if (PathingConfig.DELIVERY_EAT_AT_WAREHOUSE.get() && workBuilding instanceof BuildingDeliveryman && building instanceof BuildingWareHouse)
+        {
+            workBuilding = building;
         }
 
         final Level world = building.getColony().getWorld();
@@ -201,11 +209,12 @@ public class NewFoodUtils {
                 {
                     for (final ItemStorage storage : rackEntity.getAllContent().keySet())
                     {
-                        if ((menu == null || menu.contains(storage)) && canEat(storage.getItemStack(), citizenData.getHomeBuilding(), citizenData.getWorkBuilding(), citizenData))
+                        if ((menu == null || menu.contains(storage)) && canEat(storage.getItemStack(), citizenData.getHomeBuilding(), workBuilding, citizenData))
                         {
                             final Item food = storage.getItem();
                             final float localScore = getRecalLocalScore(citizenData, food);
-                            if (localScore == Float.MIN_VALUE){
+                            if (localScore == Float.MIN_VALUE)
+                            {
                                 return false;
                             }
                             if (localScore < bestScore)
@@ -217,7 +226,7 @@ public class NewFoodUtils {
                 }
             }
         }
-        return bestInvScore < bestScore;
+        return bestInvScore <= bestScore;
     }
 
 

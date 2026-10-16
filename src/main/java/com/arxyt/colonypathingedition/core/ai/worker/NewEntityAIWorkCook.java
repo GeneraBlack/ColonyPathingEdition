@@ -60,7 +60,7 @@ public class NewEntityAIWorkCook extends AbstractEntityAIUsesFurnace<JobCook, Bu
     /**
      * Delay between each serving.
      */
-    private static final int SERVE_DELAY = 30;
+    private static final int SERVE_DELAY = 10;
 
     /**
      * The citizen the worker is currently trying to serve.
@@ -129,6 +129,7 @@ public class NewEntityAIWorkCook extends AbstractEntityAIUsesFurnace<JobCook, Bu
 
     /**
      * Very simple action, cook straightly extract it from the furnace.
+     * Note: retrieveSmeltableFromFurnace in AbstractEntityAIUsesFurnace already calls incrementActionsDoneAndDecSaturation().
      *
      * @param furnace the furnace to retrieve from.
      */
@@ -139,12 +140,19 @@ public class NewEntityAIWorkCook extends AbstractEntityAIUsesFurnace<JobCook, Bu
                 new InvWrapper(furnace), RESULT_SLOT,
                 worker.getInventoryCitizen());
         worker.getCitizenExperienceHandler().addExperience(BASE_XP_GAIN);
-        this.incrementActionsDoneAndDecSaturation();
     }
 
     @Override
     public IAIState startWorking()
     {
+        if (building.isInBuilding(worker.blockPosition()))
+        {
+            final IAIState importantState = checkForImportantJobs();
+            if (importantState != START_WORKING)
+            {
+                return importantState;
+            }
+        }
         return super.startWorking();
     }
 
@@ -178,117 +186,316 @@ public class NewEntityAIWorkCook extends AbstractEntityAIUsesFurnace<JobCook, Bu
         }
     }
 
-    private int canServeInRow(){
-        return getPrimarySkillLevel() / 15 + 1;
+    private int canServeInRow()
+    {
+        return Math.max(4, getPrimarySkillLevel() / 10 + 3);
+    }
+
+    /**
+     * Checks whether this cook is currently actively serving or gathering food for the given customer.
+     */
+    public boolean isServingCustomer(final int citizenId)
+    {
+        if (worker instanceof EntityCitizen citizen && citizen.getCitizenAI().getState() != com.minecolonies.api.entity.ai.statemachine.states.CitizenAIState.WORK)
+        {
+            return false;
+        }
+        final IAIState currentState = getState();
+        if (currentState != COOK_SERVE_FOOD_TO_CITIZEN
+                && !(currentState == GATHERING_REQUIRED_MATERIALS && withSpecialReturn == COOK_SERVE_FOOD_TO_CITIZEN))
+        {
+            return false;
+        }
+        if (initailCitizenToServe.contains(citizenId))
+        {
+            return true;
+        }
+        for (final AbstractEntityCitizen citizen : citizenToServe)
+        {
+            if (citizen != null && citizen.getCivilianID() == citizenId)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Releases any unserved customers back to the building queue if the cook is interrupted.
+     */
+    public void releaseUnservedCustomers()
+    {
+        final BuildingCookExtra buildingExtra = (BuildingCookExtra) building;
+        while (!initailCitizenToServe.isEmpty())
+        {
+            final Integer id = initailCitizenToServe.poll();
+            if (id != null)
+            {
+                buildingExtra.releaseProcessingCustomer(id, true);
+            }
+        }
+        while (!citizenToServe.isEmpty())
+        {
+            final AbstractEntityCitizen citizen = citizenToServe.poll();
+            if (citizen != null)
+            {
+                buildingExtra.releaseProcessingCustomer(citizen.getCivilianID(), true);
+            }
+        }
+        checkCustomer = true;
+    }
+
+    /**
+     * Sorts citizenToServe so the customer closest to the worker's current position is served next.
+     */
+    private void sortCitizensToServeByDistance()
+    {
+        if (citizenToServe.size() <= 1)
+        {
+            return;
+        }
+        final java.util.List<AbstractEntityCitizen> sorted = new java.util.ArrayList<>(citizenToServe);
+        final net.minecraft.core.BlockPos workerPos = worker.blockPosition();
+        sorted.sort(java.util.Comparator.comparingDouble(c -> c.blockPosition().distSqr(workerPos)));
+        citizenToServe.clear();
+        citizenToServe.addAll(sorted);
     }
 
     /**
      * Serve food to citizen.
      * @return next IAIState
      */
-    private IAIState serveFoodToCitizen() {
+    private IAIState serveFoodToCitizen()
+    {
         worker.getCitizenData().setVisibleStatus(COOK);
-        BuildingCookExtra buildingExtra = (BuildingCookExtra) building;
-        //检查顾客格式，以请求提出顺序拿取村民所点的菜(目前为最优的单个菜系，后期可能进一步修改)
-        if (checkCustomer) {
-            final RestaurantMenuModule module = building.getModule(RESTAURANT_MENU);
-            while (!initailCitizenToServe.isEmpty()) {
-                int citizenID = initailCitizenToServe.poll();
-                ICitizenData citizenData = building.getColony().getCitizenManager().getCivilian(citizenID);
-                if (citizenData.getEntity().isEmpty()) {
+        final BuildingCookExtra buildingExtra = (BuildingCookExtra) building;
+        final RestaurantMenuModule module = building.getModule(RESTAURANT_MENU);
+
+        if (checkCustomer)
+        {
+            while (!initailCitizenToServe.isEmpty())
+            {
+                final int citizenID = initailCitizenToServe.poll();
+                final ICitizenData citizenData = building.getColony().getCitizenManager().getCivilian(citizenID);
+                if (citizenData == null || citizenData.getEntity().isEmpty())
+                {
                     buildingExtra.deleteCustomer(citizenID);
                     continue;
                 }
-                AbstractEntityCitizen citizen = citizenData.getEntity().get();
-                if (building.isInBuilding(citizen.blockPosition())) {
-                    if (NewFoodUtils.hasBestOptionInInv(worker.getInventoryCitizen(), citizenData, module.getMenu(), building)) {
-                        citizenToServe.add(citizen);
-                    } else {
-                        final ItemStorage storage = NewFoodUtils.checkForFoodInBuilding(citizenData, module.getMenu(), building);
-                        if (storage != null) {
-                            citizenToServe.add(citizen);
-                            needsCurrently = new Tuple<>(stack -> new ItemStorage(stack).equals(storage), 16);
-                            withSpecialReturn = COOK_SERVE_FOOD_TO_CITIZEN;
-                            return GATHERING_REQUIRED_MATERIALS;
-                        }
-                    }
-                } else {
+                final AbstractEntityCitizen citizen = citizenData.getEntity().get();
+                if (!building.isInBuilding(citizen.blockPosition()) || citizenData.getSaturation() >= CitizenConstants.FULL_SATURATION)
+                {
                     buildingExtra.deleteCustomer(citizenID);
+                    continue;
+                }
+
+                if (NewFoodUtils.hasBestOptionInInv(worker.getInventoryCitizen(), citizenData, module.getMenu(), building))
+                {
+                    citizenToServe.add(citizen);
+                }
+                else
+                {
+                    final ItemStorage storage = NewFoodUtils.checkForFoodInBuilding(citizenData, module.getMenu(), building);
+                    if (storage != null)
+                    {
+                        citizenToServe.add(citizen);
+                        needsCurrently = new Tuple<>(stack -> new ItemStorage(stack).equals(storage), STACKSIZE);
+                        withSpecialReturn = COOK_SERVE_FOOD_TO_CITIZEN;
+                        return GATHERING_REQUIRED_MATERIALS;
+                    }
+                    else if (NewFoodUtils.getBestFoodForCitizenWithRestaurantCheck(worker.getInventoryCitizen(), citizenData, module.getMenu(), false) != -1)
+                    {
+                        citizenToServe.add(citizen);
+                    }
+                    else
+                    {
+                        buildingExtra.deleteCustomer(citizenID);
+                    }
                 }
             }
             checkCustomer = false;
+            sortCitizensToServeByDistance();
         }
 
-        // Check overtime customer.
-        while (!citizenToServe.isEmpty()) {
-            if (!buildingExtra.checkCustomerRegistry(citizenToServe.peek().getCivilianID())) {
+        // Remove invalid, absent, or overtime customers from head of queue.
+        while (!citizenToServe.isEmpty())
+        {
+            final AbstractEntityCitizen next = citizenToServe.peek();
+            if (next == null || !next.isAlive() || !building.isInBuilding(next.blockPosition())
+                    || next.getCitizenData() == null || next.getCitizenData().getSaturation() >= CitizenConstants.FULL_SATURATION)
+            {
+                if (next != null)
+                {
+                    buildingExtra.deleteCustomer(next.getCivilianID());
+                }
+                citizenToServe.poll();
+                continue;
+            }
+            if (!buildingExtra.checkCustomerRegistry(next.getCivilianID()))
+            {
                 citizenToServe.poll();
                 continue;
             }
             break;
         }
 
-        if (citizenToServe.isEmpty()) {
+        if (citizenToServe.isEmpty())
+        {
             initailCitizenToServe.clear();
-            worker.getNavigation().stop();
             checkCustomer = true;
+            final int customerSize = buildingExtra.checkSize();
+            if (customerSize > 0)
+            {
+                final int shouldServeInRow = getShouldServeInRow(customerSize, canServeInRow());
+                initailCitizenToServe.addAll(buildingExtra.getCustomers(shouldServeInRow));
+                if (!initailCitizenToServe.isEmpty())
+                {
+                    return COOK_SERVE_FOOD_TO_CITIZEN;
+                }
+            }
+            worker.getNavigation().stop();
             return START_WORKING;
         }
 
-        if (!walkToWorkPos(citizenToServe.peek().blockPosition())) {
+        final AbstractEntityCitizen targetCitizen = citizenToServe.peek();
+        final ICitizenData targetData = targetCitizen.getCitizenData();
+
+        // Before walking to the customer, make sure we still have sufficient food in our inventory; if not, restock from racks.
+        final int preCheckSlot = NewFoodUtils.getBestFoodForCitizenWithRestaurantCheck(worker.getInventoryCitizen(), targetData, module.getMenu(), false);
+        if (preCheckSlot == -1)
+        {
+            final ItemStorage storage = NewFoodUtils.checkForFoodInBuilding(targetData, module.getMenu(), building);
+            if (storage != null)
+            {
+                needsCurrently = new Tuple<>(stack -> new ItemStorage(stack).equals(storage), STACKSIZE);
+                withSpecialReturn = COOK_SERVE_FOOD_TO_CITIZEN;
+                return GATHERING_REQUIRED_MATERIALS;
+            }
+            else
+            {
+                buildingExtra.deleteCustomer(targetCitizen.getCivilianID());
+                citizenToServe.poll();
+                return COOK_SERVE_FOOD_TO_CITIZEN;
+            }
+        }
+        else
+        {
+            final ItemStack stackInSlot = worker.getInventoryCitizen().getStackInSlot(preCheckSlot);
+            final double foodVal = Math.max(0.1, NewFoodUtils.getFoodValue(stackInSlot, targetCitizen));
+            final int neededQty = Math.max(1, (int) Math.ceil((FULL_SATURATION - targetData.getSaturation()) / foodVal));
+            final int availableInInv = InventoryUtils.getItemCountInItemHandler(
+                    worker.getInventoryCitizen(),
+                    s -> ItemStackUtils.compareItemStacksIgnoreStackSize(s, stackInSlot));
+            if (availableInInv < neededQty)
+            {
+                final ItemStorage neededStorage = new ItemStorage(stackInSlot);
+                if (InventoryUtils.getCountFromBuilding(building, List.of(neededStorage)) > 0)
+                {
+                    needsCurrently = new Tuple<>(stack -> new ItemStorage(stack).equals(neededStorage), STACKSIZE);
+                    withSpecialReturn = COOK_SERVE_FOOD_TO_CITIZEN;
+                    return GATHERING_REQUIRED_MATERIALS;
+                }
+            }
+        }
+
+        if (!walkToWorkPos(targetCitizen.blockPosition()))
+        {
             return getState();
         }
 
         final AbstractEntityCitizen citizen = citizenToServe.poll();
+        sortCitizensToServeByDistance();
         assert citizen != null;
         final InventoryCitizen handler = citizen.getInventoryCitizen();
-        final RestaurantMenuModule module = Objects.requireNonNull(worker.getCitizenData().getWorkBuilding()).getModule(RESTAURANT_MENU);
-        final Predicate<ItemStack> canEatPredicate = stack -> module.getMenu().contains(new ItemStorage(stack));
         final ICitizenData citizenData = citizen.getCitizenData();
 
-        if (!handler.hasSpace()) {
-            for (int feedingAttempts = 0; feedingAttempts < 10; feedingAttempts++) {
-                final int foodSlot = NewFoodUtils.getBestFoodForCitizenWithRestaurantCheck(worker.getInventoryCitizen(), citizenData, module.getMenu(),false);
-                if (foodSlot != -1) {
-                    final ItemStack stack = worker.getInventoryCitizen().extractItem(foodSlot, 1, false);
-                    citizenData.increaseSaturation(NewFoodUtils.getFoodValue(stack, worker));
-                    Objects.requireNonNull(worker.getCitizenColonyHandler().getColonyOrRegister()).getStatisticsManager().increment(FOOD_SERVED, worker.getCitizenColonyHandler().getColonyOrRegister().getDay());
-                    StatsUtil.trackStatByStack(building, FOOD_SERVED_DETAIL, stack, 1);
-                } else {
-                    break;
-                }
+        if (citizenData.getSaturation() >= FULL_SATURATION)
+        {
+            buildingExtra.deleteCustomer(citizen.getCivilianID());
+            return getState();
+        }
 
-                if (citizenData.getSaturation() >= CitizenConstants.FULL_SATURATION) {
-                    buildingExtra.deleteCustomer(citizen.getCivilianID());
-                    break;
+        int totalServedCount = 0;
+        double remainingSatNeeded = FULL_SATURATION - citizenData.getSaturation();
+
+        while (remainingSatNeeded > 0)
+        {
+            final int foodSlot = NewFoodUtils.getBestFoodForCitizenWithRestaurantCheck(worker.getInventoryCitizen(), citizenData, module.getMenu(), false);
+            if (foodSlot == -1)
+            {
+                break;
+            }
+
+            final ItemStack slotStack = worker.getInventoryCitizen().getStackInSlot(foodSlot);
+            final double foodValue = Math.max(0.1, NewFoodUtils.getFoodValue(slotStack, citizen));
+            final int qtyNeeded = Math.max(1, (int) Math.ceil(remainingSatNeeded / foodValue));
+            final int qtyToTake = Math.min(qtyNeeded, slotStack.getCount());
+            final String foodName = slotStack.getDescriptionId();
+
+            final ItemStack extracted = worker.getInventoryCitizen().extractItem(foodSlot, qtyToTake, false);
+            if (extracted.isEmpty())
+            {
+                break;
+            }
+
+            final ItemStack remainder = InventoryUtils.addItemStackToItemHandlerWithResult(handler, extracted);
+            final int insertedCount = extracted.getCount() - remainder.getCount();
+            int fedDirectlyCount = 0;
+
+            if (!remainder.isEmpty())
+            {
+                while (!remainder.isEmpty() && citizenData.getSaturation() < FULL_SATURATION)
+                {
+                    final ItemStack singleFood = remainder.split(1);
+                    citizenData.getCitizenFoodHandler().addLastEaten(singleFood.getItem());
+                    NewFoodUtils.consumeFood(singleFood, citizen, null);
+                    fedDirectlyCount++;
+                }
+                if (!remainder.isEmpty())
+                {
+                    InventoryUtils.addItemStackToItemHandler(worker.getInventoryCitizen(), remainder);
                 }
             }
-            return getState();
+
+            final int servedNow = insertedCount + fedDirectlyCount;
+            if (servedNow <= 0)
+            {
+                break;
+            }
+
+            totalServedCount += servedNow;
+            remainingSatNeeded -= servedNow * foodValue;
+            Objects.requireNonNull(worker.getCitizenColonyHandler().getColonyOrRegister())
+                    .getStatisticsManager().incrementBy(FOOD_SERVED, servedNow, worker.getCitizenColonyHandler().getColonyOrRegister().getDay());
+            StatsUtil.trackStatByName(building, FOOD_SERVED_DETAIL, foodName, servedNow);
+
+            if (citizenData.getSaturation() >= FULL_SATURATION)
+            {
+                break;
+            }
         }
 
-
-        final int foodSlot = NewFoodUtils.getBestFoodForCitizenWithRestaurantCheck(worker.getInventoryCitizen(), citizenData, module.getMenu(),false);
-        if (foodSlot == -1) {
+        if (totalServedCount > 0)
+        {
+            if (citizenData.getHomeBuilding() != null && citizenData.getHomeBuilding().getBuildingLevel() > building.getBuildingLevel() + 1)
+            {
+                worker.getCitizenData().triggerInteraction(new StandardInteraction(Component.translatable(POOR_RESTAURANT_INTERACTION), ChatPriority.BLOCKING));
+            }
             buildingExtra.deleteCustomer(citizen.getCivilianID());
-            return getState();
-        }
-
-        if (InventoryUtils.hasItemInItemHandler(handler, canEatPredicate)) {
-            buildingExtra.deleteCustomer(citizen.getCivilianID());
-        }
-
-        if (citizenData.getHomeBuilding() != null && citizenData.getHomeBuilding().getBuildingLevel() > building.getBuildingLevel() + 1) {
-            worker.getCitizenData().triggerInteraction(new StandardInteraction(Component.translatable(POOR_RESTAURANT_INTERACTION), ChatPriority.BLOCKING));
-        }
-
-        String foodName = worker.getInventoryCitizen().getStackInSlot(foodSlot).getDescriptionId();
-        int qty = (int) (Math.max(1.0, (FULL_SATURATION - citizen.getCitizenData().getSaturation()) / NewFoodUtils.getFoodValue(worker.getInventoryCitizen().getStackInSlot(foodSlot), citizen)));
-        if (InventoryUtils.transferXOfItemStackIntoNextFreeSlotInItemHandler(worker.getInventoryCitizen(), foodSlot, qty, citizenData.getInventory())) {
-            buildingExtra.deleteCustomer(citizen.getCivilianID());
-            Objects.requireNonNull(worker.getCitizenColonyHandler().getColonyOrRegister()).getStatisticsManager().incrementBy(FOOD_SERVED, qty, worker.getCitizenColonyHandler().getColonyOrRegister().getDay());
-            StatsUtil.trackStatByName(building, FOOD_SERVED_DETAIL, foodName, qty);
             worker.getCitizenExperienceHandler().addExperience(BASE_XP_GAIN);
             worker.decreaseSaturationForAction();
+        }
+        else
+        {
+            final ItemStorage storage = NewFoodUtils.checkForFoodInBuilding(citizenData, module.getMenu(), building);
+            if (storage != null)
+            {
+                citizenToServe.add(citizen);
+                needsCurrently = new Tuple<>(stack -> new ItemStorage(stack).equals(storage), STACKSIZE);
+                withSpecialReturn = COOK_SERVE_FOOD_TO_CITIZEN;
+                return GATHERING_REQUIRED_MATERIALS;
+            }
+            buildingExtra.deleteCustomer(citizen.getCivilianID());
         }
 
         return getState();
@@ -397,9 +604,11 @@ public class NewEntityAIWorkCook extends AbstractEntityAIUsesFurnace<JobCook, Bu
         //检查在路上的客人是否已经取消预订或已到店
         for(int customerId : cookExtra.getOrders()) {
             ICitizenData citizenData = building.getColony().getCitizenManager().getCivilian(customerId);
-            if(citizenData.getEntity().isPresent() &&  citizenData.getEntity().get() instanceof EntityCitizen citizen){
+            if (citizenData == null || citizenData.getEntity().isEmpty()) {
+                cookExtra.reached(customerId);
+            } else if (citizenData.getEntity().get() instanceof EntityCitizen citizen) {
                 IState state = citizen.getCitizenAI().getState();
-                if( state != NewEntityAIEat.NewEatingState.CHECK_FOOD && state != NewEntityAIEat.NewEatingState.GO_TO_RESTAURANT) {
+                if (state != NewEntityAIEat.NewEatingState.CHECK_FOOD && state != NewEntityAIEat.NewEatingState.GO_TO_RESTAURANT) {
                     cookExtra.reached(customerId);
                 }
             }
@@ -427,6 +636,7 @@ public class NewEntityAIWorkCook extends AbstractEntityAIUsesFurnace<JobCook, Bu
             final int canServeInRow = canServeInRow();
             int shouldServeInRow = getShouldServeInRow(customerSize, canServeInRow);
             initailCitizenToServe = new ArrayDeque<>(cookExtra.getCustomers(shouldServeInRow));
+            checkCustomer = true;
         }
 
         if (!initailCitizenToServe.isEmpty() || !citizenToServe.isEmpty())
@@ -438,10 +648,10 @@ public class NewEntityAIWorkCook extends AbstractEntityAIUsesFurnace<JobCook, Bu
     }
 
     private int getShouldServeInRow(int customerSize, int canServeInRow) {
-        final int workerSize = building.getAllAssignedCitizen().size();
+        final int workerSize = Math.max(1, building.getAllAssignedCitizen().size());
         int shouldServeInRow = (customerSize - 1) / workerSize + 1;
-        // The check customerSize <= 3 is to prevent the allocation efficiency from being affected when a cook fails to start work for some reason; this approach is relatively less costly compared to detecting which cook is on duty.
-        if (customerSize <= 3){
+        // The check customerSize <= 4 is to prevent the allocation efficiency from being affected when a cook fails to start work for some reason; this approach is relatively less costly compared to detecting which cook is on duty.
+        if (customerSize <= 4){
             shouldServeInRow = Math.min(canServeInRow, customerSize);
         }
         else if (canServeInRow < shouldServeInRow) {
@@ -453,7 +663,15 @@ public class NewEntityAIWorkCook extends AbstractEntityAIUsesFurnace<JobCook, Bu
     @Override
     protected int getActionsDoneUntilDumping()
     {
-        return 1;
+        if (!citizenToServe.isEmpty() || !initailCitizenToServe.isEmpty() || !playerToServe.isEmpty())
+        {
+            return Integer.MAX_VALUE;
+        }
+        if (((BuildingCookExtra) building).checkSize() > 0)
+        {
+            return 32;
+        }
+        return getPositionOfOvenToRetrieveFrom() == null ? 1 : Math.max(1, building.getBuildingLevel());
     }
 
     @Override

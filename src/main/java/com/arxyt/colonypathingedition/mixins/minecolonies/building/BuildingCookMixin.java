@@ -1,9 +1,16 @@
 package com.arxyt.colonypathingedition.mixins.minecolonies.building;
 
 import com.arxyt.colonypathingedition.api.workersetting.BuildingCookExtra;
+import com.arxyt.colonypathingedition.core.ai.minimal.NewEntityAIEat;
+import com.arxyt.colonypathingedition.core.ai.worker.NewEntityAIWorkCook;
+import com.minecolonies.api.colony.ICitizenData;
 import com.minecolonies.api.colony.IColony;
+import com.minecolonies.api.entity.ai.statemachine.states.CitizenAIState;
+import com.minecolonies.api.entity.ai.statemachine.states.IState;
+import com.minecolonies.api.util.constant.CitizenConstants;
 import com.minecolonies.core.colony.buildings.AbstractBuilding;
 import com.minecolonies.core.colony.buildings.workerbuildings.BuildingCook;
+import com.minecolonies.core.entity.citizen.EntityCitizen;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
@@ -16,9 +23,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public abstract class BuildingCookMixin extends AbstractBuilding implements BuildingCookExtra {
     private final Queue<Integer> customerQueue = new ConcurrentLinkedQueue<>();
     private final Set<Integer> processingCustomers = ConcurrentHashMap.newKeySet();
-    private final HashSet<Integer> customersOnTheWay = new HashSet<>();
-    private final HashMap<UUID,Integer> playerFed = new HashMap<>();
-    private final HashMap<UUID,Integer> playerServing = new HashMap<>();
+    private final Set<Integer> customersOnTheWay = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, Integer> playerFed = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> playerServing = new ConcurrentHashMap<>();
 
     public BuildingCookMixin(final IColony c, final BlockPos l)
     {
@@ -52,7 +59,17 @@ public abstract class BuildingCookMixin extends AbstractBuilding implements Buil
         List<Integer> assigned = new ArrayList<>();
         while (assigned.size() < maxCount && !customerQueue.isEmpty()) {
             Integer customerId = customerQueue.poll();
-            if (customerId != null && processingCustomers.add(customerId)) {
+            if (customerId == null) {
+                continue;
+            }
+            ICitizenData citizenData = getColony().getCitizenManager().getCivilian(customerId);
+            if (citizenData == null || citizenData.getEntity().isEmpty()
+                    || !isInBuilding(citizenData.getEntity().get().blockPosition())
+                    || citizenData.getSaturation() >= CitizenConstants.FULL_SATURATION) {
+                processingCustomers.remove(customerId);
+                continue;
+            }
+            if (processingCustomers.add(customerId)) {
                 assigned.add(customerId);
             }
         }
@@ -62,7 +79,7 @@ public abstract class BuildingCookMixin extends AbstractBuilding implements Buil
     // 释放 Customer
     public void releaseProcessingCustomer(int customerId, boolean requeue) {
         processingCustomers.remove(customerId);
-        if (requeue) {
+        if (requeue && !customerQueue.contains(customerId)) {
             customerQueue.offer(customerId);
         }
     }
@@ -122,22 +139,78 @@ public abstract class BuildingCookMixin extends AbstractBuilding implements Buil
     @Override
     public void onColonyTick(final IColony colony) {
         super.onColonyTick(colony);
-        for(UUID playerID : playerFed.keySet()) {
-            int cooldown = playerFed.get(playerID);
-            if(--cooldown <= 0){
-                playerFed.remove(playerID);
-            }
-            else{
-                playerFed.replace(playerID, cooldown);
+        for (Iterator<Map.Entry<UUID, Integer>> it = playerFed.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<UUID, Integer> entry = it.next();
+            int cooldown = entry.getValue() - 1;
+            if (cooldown <= 0) {
+                it.remove();
+            } else {
+                entry.setValue(cooldown);
             }
         }
-        for(UUID playerID : playerServing.keySet()) {
-            int cooldown = playerServing.get(playerID);
-            if(--cooldown <= 0){
-                playerServing.remove(playerID);
+        for (Iterator<Map.Entry<UUID, Integer>> it = playerServing.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<UUID, Integer> entry = it.next();
+            int cooldown = entry.getValue() - 1;
+            if (cooldown <= 0) {
+                it.remove();
+            } else {
+                entry.setValue(cooldown);
             }
-            else{
-                playerServing.replace(playerID, cooldown);
+        }
+
+        // Clean up customersOnTheWay who already arrived or cancelled
+        for (Integer customerId : new ArrayList<>(customersOnTheWay)) {
+            ICitizenData citizenData = colony.getCitizenManager().getCivilian(customerId);
+            if (citizenData == null || citizenData.getEntity().isEmpty()) {
+                customersOnTheWay.remove(customerId);
+            } else if (citizenData.getEntity().get() instanceof EntityCitizen citizen) {
+                IState state = citizen.getCitizenAI().getState();
+                if (state != NewEntityAIEat.NewEatingState.CHECK_FOOD && state != NewEntityAIEat.NewEatingState.GO_TO_RESTAURANT) {
+                    customersOnTheWay.remove(customerId);
+                }
+            }
+        }
+
+        // If an assigned cook left work (e.g. to eat or sleep), release their unserved customers back to the queue
+        final List<NewEntityAIWorkCook> activeCooks = new ArrayList<>();
+        for (ICitizenData workerData : getAllAssignedCitizen()) {
+            if (workerData.getEntity().isPresent() && workerData.getEntity().get() instanceof EntityCitizen workerEntity) {
+                if (workerEntity.getCitizenJobHandler().getWorkAI() instanceof NewEntityAIWorkCook cookAI) {
+                    if (workerEntity.getCitizenAI().getState() != CitizenAIState.WORK) {
+                        cookAI.releaseUnservedCustomers();
+                    } else {
+                        activeCooks.add(cookAI);
+                    }
+                }
+            }
+        }
+
+        // Clean up stale entries in customerQueue
+        customerQueue.removeIf(customerId -> {
+            ICitizenData citizenData = colony.getCitizenManager().getCivilian(customerId);
+            return citizenData == null || citizenData.getEntity().isEmpty()
+                    || !isInBuilding(citizenData.getEntity().get().blockPosition())
+                    || citizenData.getSaturation() >= CitizenConstants.FULL_SATURATION;
+        });
+
+        // Rescue any orphaned customers in processingCustomers
+        for (Integer customerId : new ArrayList<>(processingCustomers)) {
+            ICitizenData citizenData = colony.getCitizenManager().getCivilian(customerId);
+            if (citizenData == null || citizenData.getEntity().isEmpty()
+                    || !isInBuilding(citizenData.getEntity().get().blockPosition())
+                    || citizenData.getSaturation() >= CitizenConstants.FULL_SATURATION) {
+                processingCustomers.remove(customerId);
+                continue;
+            }
+            boolean beingServed = false;
+            for (NewEntityAIWorkCook cookAI : activeCooks) {
+                if (cookAI.isServingCustomer(customerId)) {
+                    beingServed = true;
+                    break;
+                }
+            }
+            if (!beingServed) {
+                releaseProcessingCustomer(customerId, true);
             }
         }
     }

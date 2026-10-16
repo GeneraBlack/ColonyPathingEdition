@@ -133,6 +133,9 @@ public class NewEntityAIEat implements IStateAI {
     private void reset(){
         citizen.releaseUsingItem();
         citizen.stopUsingItem();
+        if (citizen.isPassenger()) {
+            citizen.stopRiding();
+        }
         citizen.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
         citizen.getCitizenData().setVisibleStatus(null);
         checkState = CHECK_INHAND;
@@ -402,18 +405,22 @@ public class NewEntityAIEat implements IStateAI {
     {
         IJob<?> jobCitizen = citizen.getCitizenData().getJob();
         BuildingCookExtra restaurantExtra = ((BuildingCookExtra)restaurant);
+
+        // A state reset if they are full (e.g., directly fed at the table by the cook).
+        if (citizen.getCitizenData().getSaturation() >= FULL_SATURATION) {
+            restaurantExtra.deleteCustomer(citizen.getCivilianID());
+            citizen.getCitizenData().setJustAte(true);
+            reset();
+            return DONE;
+        }
+
         if(!restaurantExtra.checkCustomerRegistry(citizen.getCivilianID()) || !STAFFED_RESTAURANTS.test((BuildingCook)restaurant) || !WorldUtil.isPastTime(citizen.level(), NIGHT - 2100) || (jobCitizen != null && JOBS_EAT_IMMEDIATELY.contains(jobCitizen.getClass())) || eatPos == null){
             restaurantExtra.deleteCustomer(citizen.getCivilianID());
             waitingTicks = 0;
             timeOutWalking = 0;
             if (hasFood(false)) return EAT;
-            else return GET_FOOD_YOURSELF;
-        }
-
-        // A state reset if they are full.
-        if(citizen.getCitizenData().getSaturation() == FULL_SATURATION){
-            reset();
-            return DONE;
+            if (citizen.isPassenger()) citizen.stopRiding();
+            return GET_FOOD_YOURSELF;
         }
 
         if(hasFood(true)) {
@@ -428,6 +435,7 @@ public class NewEntityAIEat implements IStateAI {
             waitingTicks = 0;
             timeOutWalking = 0;
             restaurantExtra.deleteCustomer(citizen.getCivilianID());
+            if (citizen.isPassenger()) citizen.stopRiding();
             return GET_FOOD_YOURSELF;
         }
 
@@ -439,6 +447,7 @@ public class NewEntityAIEat implements IStateAI {
                 waitingTicks = 0;
                 timeOutWalking = 0;
                 restaurantExtra.deleteCustomer(citizen.getCivilianID());
+                if (citizen.isPassenger()) citizen.stopRiding();
                 return GET_FOOD_YOURSELF;
             }
             waitingTicks += WAITING_DELAY;
